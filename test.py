@@ -1,6 +1,6 @@
 import csv
 
-file_path = "dane.csv"
+file_path = "data/dane.csv"
 
 try:
     with open(file_path, mode="w", newline="", encoding="utf-8") as file:
