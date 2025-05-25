@@ -104,5 +104,5 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Nieoczekiwany błąd w pętli głównej: {e}")
 
-        print(f"Następny odczyt za 120 sekund (o {datetime.datetime.now() + datetime.timedelta(seconds=120)})")
-        time.sleep(120)  # Oczekiwanie 2 minuty przed kolejną iteracją
+        print(f"Następny odczyt za 300 sekund (o {datetime.datetime.now() + datetime.timedelta(seconds=120)})")
+        time.sleep(300)  # Oczekiwanie 5 minuty przed kolejną iteracją
