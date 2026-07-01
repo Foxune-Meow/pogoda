@@ -18,6 +18,7 @@ Uruchomienie jako serwis:
 import os
 import sys
 import time
+import socket
 import datetime
 import csv
 import git
@@ -48,6 +49,7 @@ PUSH_TIMEOUT_SEC  = 90            # maks. czas git push [s]
 LOG_FILE          = os.path.join(BASE_DIR, "bmp.log")
 LOG_MAX_BYTES     = 5 * 1024 * 1024   # 5 MB na plik logu
 LOG_BACKUP_COUNT  = 3                  # trzymaj 3 stare pliki logu
+FIXED_CSV_PATH    = os.path.join(BASE_DIR, "dane.csv")  # stały plik zbiorczy
 
 # Token GitHub ze zmiennej środowiskowej (NIE wpisuj tokena bezpośrednio w kodzie)
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
@@ -78,6 +80,25 @@ def _setup_logger() -> logging.Logger:
 
 
 logger = _setup_logger()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SYSTEMD WATCHDOG – heartbeat żeby systemd wiedział że program żyje
+# ─────────────────────────────────────────────────────────────────────────────
+def watchdog_ping() -> None:
+    """Wysyła sygnał WATCHDOG=1 do systemd przez gniazdo NOTIFY_SOCKET.
+    Bez tego wywołania systemd uznaje program za zawieszony i go zabija.
+    Bezpieczne do wywołania nawet gdy serwis nie jest uruchomiony przez systemd."""
+    notify_socket = os.environ.get("NOTIFY_SOCKET")
+    if not notify_socket:
+        return
+    try:
+        # Gniazda zaczynające się od '@' używają przestrzeni nazw abstrakcyjnych
+        addr = "\0" + notify_socket[1:] if notify_socket.startswith("@") else notify_socket
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.sendto(b"WATCHDOG=1", addr)
+    except Exception:
+        pass  # błąd watchdoga nie może zatrzymać programu
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STAN WSPÓŁDZIELONY (tylko wątek główny go modyfikuje – brak race condition)
@@ -181,8 +202,25 @@ def check_disk_space() -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 #  ZAPIS DO CSV (z blokadą pliku i wymuszonym zapisem na dysk)
 # ─────────────────────────────────────────────────────────────────────────────
+def _append_row(path: str, row: list, write_header: bool) -> None:
+    """Pomocnicza: dopisuje jeden wiersz do pliku CSV z blokadą i fsync."""
+    with open(path, mode="a", newline="", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(["timestamp", "temp_bmp_c", "temp_cpu_c"])
+            writer.writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def write_to_csv() -> bool:
-    """Zapisuje jeden pomiar do miesięcznego pliku CSV.
+    """Zapisuje jeden pomiar do:
+      - miesięcznego pliku CSV (dane_YYYY-MM.csv)  – rotacja, nie rośnie wiecznie
+      - stałego pliku dane.csv                     – dla kompatybilności wstecznej
     Zwraca True przy sukcesie."""
     if not check_disk_space():
         return False
@@ -195,35 +233,32 @@ def write_to_csv() -> bool:
         logger.warning(f"{timestamp} – Brak odczytu BMP280, pomijam zapis do CSV.")
         return False
 
-    path        = get_csv_path()
-    write_header = not os.path.exists(path)
+    row = [timestamp, bmp_temp, cpu_temp if cpu_temp is not None else ""]
+    ok  = True
 
+    # ── 1. Miesięczny plik (rotacja) ─────────────────────────────────────────
+    monthly_path   = get_csv_path()
+    monthly_header = not os.path.exists(monthly_path)
     try:
-        with open(path, mode="a", newline="", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)          # wyłączna blokada pliku
-            try:
-                writer = csv.writer(f)
-                if write_header:
-                    writer.writerow(["timestamp", "temp_bmp_c", "temp_cpu_c"])
-                writer.writerow([
-                    timestamp,
-                    bmp_temp,
-                    cpu_temp if cpu_temp is not None else ""
-                ])
-                f.flush()
-                os.fsync(f.fileno())                # wymuszony zapis na kartę SD
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)       # zawsze zdejmij blokadę
+        _append_row(monthly_path, row, monthly_header)
+    except OSError as e:
+        logger.error(f"Błąd zapisu do pliku miesięcznego ({monthly_path}): {e}")
+        ok = False
 
+    # ── 2. Stały plik dane.csv (zbiorczy) ────────────────────────────────────
+    fixed_header = not os.path.exists(FIXED_CSV_PATH)
+    try:
+        _append_row(FIXED_CSV_PATH, row, fixed_header)
+    except OSError as e:
+        logger.error(f"Błąd zapisu do dane.csv: {e}")
+        # nie zwracaj False – miesięczny zapis mógł się udać
+
+    if ok:
         logger.info(
             f"Pomiar #{measurement_cnt:>6} | {timestamp}"
             f" | BMP={bmp_temp}°C | CPU={cpu_temp}°C"
         )
-        return True
-
-    except OSError as e:
-        logger.error(f"Błąd zapisu do CSV ({path}): {e}")
-        return False
+    return ok
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -406,6 +441,9 @@ def main() -> None:
 
         try:
             measurement_cnt += 1
+
+            # ── 0. Heartbeat watchdog – informuj systemd że program żyje ────
+            watchdog_ping()
 
             # ── 1. Zapis pomiaru do CSV ──────────────────────────────────────
             saved = write_to_csv()
